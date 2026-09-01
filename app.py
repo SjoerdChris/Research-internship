@@ -549,7 +549,6 @@ with llm_column:
 
     )
     st.info(
-    st.info(
         "Please do not share any personal information with the LLM."
     )
     conversation = (
