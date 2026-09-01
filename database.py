@@ -6,6 +6,7 @@ from sqlalchemy import text
 # Connection
 # =========================================================
 
+
 def get_connection():
     """
     Return the Streamlit PostgreSQL connection.
@@ -23,10 +24,13 @@ def get_connection():
 # Database initialization
 # =========================================================
 
+
 def init_database() -> None:
     """
-    Create the tables needed for the experiment.
-    Existing tables are left untouched.
+    Create all tables needed for the experiment.
+
+    Existing tables are left untouched. New tables are created
+    when they do not yet exist.
     """
 
     connection = get_connection()
@@ -45,6 +49,29 @@ def init_database() -> None:
                 DEFAULT CURRENT_TIMESTAMP,
 
             completed_at TIMESTAMPTZ
+        );
+    """
+
+    # Records which randomly selected ecological problem appeared
+    # at each question position, and which LLM condition was used.
+    create_participant_questions = """
+        CREATE TABLE IF NOT EXISTS participant_questions (
+            participant_id TEXT NOT NULL
+                REFERENCES participants(participant_id)
+                ON DELETE CASCADE,
+
+            question_nr INTEGER NOT NULL
+                CHECK (question_nr > 0),
+
+            question_id TEXT NOT NULL,
+
+            condition TEXT NOT NULL
+                CHECK (condition IN ('baseline', 'openness')),
+
+            PRIMARY KEY (
+                participant_id,
+                question_nr
+            )
         );
     """
 
@@ -109,16 +136,43 @@ def init_database() -> None:
         );
     """
 
+    # One questionnaire row per participant. The three closed
+    # comparison items use the same five response options.
+    create_questionnaire_responses = """
+        CREATE TABLE IF NOT EXISTS questionnaire_responses (
+            participant_id TEXT PRIMARY KEY
+                REFERENCES participants(participant_id)
+                ON DELETE CASCADE,
+
+            perspectives TEXT NOT NULL,
+
+            steering_toward_conclusion TEXT NOT NULL,
+
+            uncertainty_and_limitations TEXT NOT NULL,
+
+            comments TEXT,
+
+            created_at TIMESTAMPTZ NOT NULL
+                DEFAULT CURRENT_TIMESTAMP,
+
+            updated_at TIMESTAMPTZ NOT NULL
+                DEFAULT CURRENT_TIMESTAMP
+        );
+    """
+
     with connection.session as session:
         session.execute(text(create_participants))
+        session.execute(text(create_participant_questions))
         session.execute(text(create_messages))
         session.execute(text(create_submissions))
+        session.execute(text(create_questionnaire_responses))
         session.commit()
 
 
 # =========================================================
 # Participants
 # =========================================================
+
 
 def register_participant(
     participant_id: str,
@@ -154,20 +208,46 @@ def register_participant(
         session.commit()
 
 
-def set_participant_condition(
+
+def save_question_assignment(
     participant_id: str,
+    question_nr: int,
+    question_id: str,
     condition: str
 ) -> None:
+    """
+    Store the randomized problem and LLM condition used at a
+    particular question position.
+    """
 
     if condition not in {"baseline", "openness"}:
         raise ValueError("Invalid experimental condition.")
 
+    if question_nr <= 0:
+        raise ValueError("question_nr must be greater than zero.")
+
     connection = get_connection()
 
     query = text("""
-        UPDATE participants
-        SET condition = :condition
-        WHERE participant_id = :participant_id;
+        INSERT INTO participant_questions (
+            participant_id,
+            question_nr,
+            question_id,
+            condition
+        )
+        VALUES (
+            :participant_id,
+            :question_nr,
+            :question_id,
+            :condition
+        )
+        ON CONFLICT (
+            participant_id,
+            question_nr
+        )
+        DO UPDATE SET
+            question_id = EXCLUDED.question_id,
+            condition = EXCLUDED.condition;
     """)
 
     with connection.session as session:
@@ -175,10 +255,13 @@ def set_participant_condition(
             query,
             {
                 "participant_id": participant_id,
+                "question_nr": question_nr,
+                "question_id": question_id,
                 "condition": condition
             }
         )
         session.commit()
+
 
 
 def mark_participant_completed(
@@ -206,6 +289,7 @@ def mark_participant_completed(
 # =========================================================
 # LLM messages
 # =========================================================
+
 
 def save_llm_message(
     participant_id: str,
@@ -261,9 +345,75 @@ def save_llm_message(
         session.commit()
 
 
+
+def save_llm_exchange(
+    participant_id: str,
+    question_nr: int,
+    message_nr: int,
+    user_content: str,
+    assistant_content: str
+) -> None:
+    """
+    Save one complete user/assistant exchange in a single
+    transaction so the database cannot contain only half of a
+    successful interaction.
+    """
+
+    connection = get_connection()
+
+    query = text("""
+        INSERT INTO messages (
+            participant_id,
+            question_nr,
+            message_nr,
+            role,
+            content
+        )
+        VALUES (
+            :participant_id,
+            :question_nr,
+            :message_nr,
+            :role,
+            :content
+        )
+        ON CONFLICT (
+            participant_id,
+            question_nr,
+            message_nr,
+            role
+        )
+        DO UPDATE SET
+            content = EXCLUDED.content;
+    """)
+
+    with connection.session as session:
+        session.execute(
+            query,
+            {
+                "participant_id": participant_id,
+                "question_nr": question_nr,
+                "message_nr": message_nr,
+                "role": "user",
+                "content": user_content
+            }
+        )
+        session.execute(
+            query,
+            {
+                "participant_id": participant_id,
+                "question_nr": question_nr,
+                "message_nr": message_nr,
+                "role": "assistant",
+                "content": assistant_content
+            }
+        )
+        session.commit()
+
+
 # =========================================================
 # Participant submissions
 # =========================================================
+
 
 def save_submission(
     participant_id: str,
@@ -310,6 +460,63 @@ def save_submission(
                 "question_nr": question_nr,
                 "response_type": response_type,
                 "content": content
+            }
+        )
+        session.commit()
+
+
+# =========================================================
+# Questionnaire
+# =========================================================
+
+
+def save_questionnaire_response(
+    participant_id: str,
+    perspectives: str,
+    steering_toward_conclusion: str,
+    uncertainty_and_limitations: str,
+    comments: str | None = None
+) -> None:
+    """
+    Save or update the questionnaire responses for one
+    participant.
+    """
+
+    connection = get_connection()
+
+    query = text("""
+        INSERT INTO questionnaire_responses (
+            participant_id,
+            perspectives,
+            steering_toward_conclusion,
+            uncertainty_and_limitations,
+            comments
+        )
+        VALUES (
+            :participant_id,
+            :perspectives,
+            :steering_toward_conclusion,
+            :uncertainty_and_limitations,
+            :comments
+        )
+        ON CONFLICT (participant_id)
+        DO UPDATE SET
+            perspectives = EXCLUDED.perspectives,
+            steering_toward_conclusion = EXCLUDED.steering_toward_conclusion,
+            uncertainty_and_limitations = EXCLUDED.uncertainty_and_limitations,
+            comments = EXCLUDED.comments,
+            updated_at = CURRENT_TIMESTAMP;
+    """)
+
+    with connection.session as session:
+        session.execute(
+            query,
+            {
+                "participant_id": participant_id,
+                "perspectives": perspectives,
+                "steering_toward_conclusion": steering_toward_conclusion,
+                "uncertainty_and_limitations": uncertainty_and_limitations,
+                "comments": comments
             }
         )
         session.commit()

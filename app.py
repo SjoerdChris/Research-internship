@@ -6,11 +6,12 @@ import streamlit as st
 from database import (
     init_database,
     register_participant,
-    save_llm_message,
+    save_question_assignment,
+    save_llm_exchange,
     save_submission,
-    mark_participant_completed
+    save_questionnaire_response,
+    mark_participant_completed,
 )
-
 from llm import generate_llm_reply
 
 
@@ -20,7 +21,7 @@ from llm import generate_llm_reply
 
 st.set_page_config(
     page_title="LLM Openness Experiment",
-    layout="wide"
+    layout="wide",
 )
 
 st.title("LLM Openness Experiment")
@@ -30,35 +31,33 @@ st.title("LLM Openness Experiment")
 # Experiment configuration
 # =========================================================
 
-# Maximum number of messages a participant can send to
-# the LLM for each question.
-#
-# Change this value if desired.
-
-
-
 TASK_INSTRUCTION = """
 Develop a strategy for managing this ecosystem.
 Explain why you chose this strategy and justify your reasoning.
 """
 
 
-# =========================================================
-# Initialize PostgreSQL
-# =========================================================
-
-@st.cache_resource
-def setup_database():
-    init_database()
-    return True
+# Condition depends on the position in the experiment,
+# not on which ecological problem was randomly selected.
+CONDITION_BY_QUESTION_INDEX = {
+    0: "baseline",
+    1: "openness",
+}
 
 
-setup_database()
+QUESTIONNAIRE_OPTIONS = [
+    "Much more in Question 1",
+    "Slightly more in Question 1",
+    "About the same",
+    "Slightly more in Question 2",
+    "Much more in Question 2",
+]
 
 
 # =========================================================
 # Questions
 # =========================================================
+
 QUESTION_BANK = [
     {
         "id": "kelp",
@@ -87,9 +86,8 @@ the species involved, and the available budget does not allow
 all measures to be implemented simultaneously. The strengths
 of several feeding relationships and their responses to future
 warming remain uncertain.
-"""
+""",
     },
-
     {
         "id": "dunes",
         "text": """
@@ -118,103 +116,190 @@ It is unclear to what extent the present species distributions
 reflect environmental conditions, competition between species,
 limitations on colonisation, or simply historical and stochastic
 changes in abundance.
-"""
-    }
+""",
+    },
 ]
 
 
 # =========================================================
-# Initialize participant
+# Database initialization
+# =========================================================
+
+@st.cache_resource
+def setup_database():
+    init_database()
+    return True
+
+
+try:
+    setup_database()
+except Exception as error:
+    print("Database initialization error:", repr(error))
+    st.error(
+        "The experiment database could not be initialized. "
+        "Please inform the researcher."
+    )
+    st.stop()
+
+
+# =========================================================
+# Initialize participant/session
 # =========================================================
 
 if "participant_id" not in st.session_state:
+    st.session_state.participant_id = uuid.uuid4().hex
 
-    st.session_state.participant_id = (
-        uuid.uuid4().hex
-    )
-
-
-participant_id = (
-    st.session_state.participant_id
-)
-
-
-# =========================================================
-# Assign experimental condition
-# =========================================================
 
 if "question_order" not in st.session_state:
     st.session_state.question_order = random.sample(
         QUESTION_BANK,
-        k=len(QUESTION_BANK)
+        k=len(QUESTION_BANK),
     )
 
 
-QUESTIONS = st.session_state.question_order
-
-
-
-
-# =========================================================
-# Register participant
-# =========================================================
-
-
-
-register_participant(
-    participant_id=participant_id,
-    condition=None
-)
-
-
-# =========================================================
-# Initialize experiment state
-# =========================================================
-
 if "current_question" not in st.session_state:
-
     st.session_state.current_question = 0
 
 
 if "answers" not in st.session_state:
-
     st.session_state.answers = {
         question_nr: ""
-        for question_nr
-        in range(len(QUESTIONS))
+        for question_nr in range(
+            len(st.session_state.question_order)
+        )
     }
 
 
 if "llm_messages" not in st.session_state:
-
     st.session_state.llm_messages = {
         question_nr: []
-        for question_nr
-        in range(len(QUESTIONS))
+        for question_nr in range(
+            len(st.session_state.question_order)
+        )
     }
 
 
-if "submitted" not in st.session_state:
+# Tracks whether the pre-LLM answer snapshot has already
+# been saved for each question.
+if "initial_submission_saved" not in st.session_state:
+    st.session_state.initial_submission_saved = {
+        question_nr: False
+        for question_nr in range(
+            len(st.session_state.question_order)
+        )
+    }
 
-    st.session_state.submitted = False
+
+if "questionnaire" not in st.session_state:
+    st.session_state.questionnaire = None
 
 
-question_index = (
-    st.session_state.current_question
-)
-if question_index == 0:
-    condition = "baseline"
-else:
-    condition = "openness"  
+if "stage" not in st.session_state:
+    st.session_state.stage = "questions"
+
+
+participant_id = st.session_state.participant_id
+QUESTIONS = st.session_state.question_order
+
+
+# =========================================================
+# Helper functions
+# =========================================================
+
+def get_condition(question_index: int) -> str:
+    try:
+        return CONDITION_BY_QUESTION_INDEX[question_index]
+    except KeyError as error:
+        raise ValueError(
+            "No experimental condition configured for "
+            f"question index {question_index}."
+        ) from error
+
+
+def save_final_answer(question_index: int) -> None:
+    """
+    Save the current final answer for one question.
+    Upsert semantics in database.py allow later edits.
+    """
+    save_submission(
+        participant_id=participant_id,
+        question_nr=question_index + 1,
+        response_type="final",
+        content=st.session_state.answers[
+            question_index
+        ].strip(),
+    )
+
+
+def save_initial_answer_if_needed(
+    question_index: int,
+) -> None:
+    """
+    Save a snapshot of the participant's answer immediately
+    before their first LLM interaction for this question.
+    """
+    if st.session_state.initial_submission_saved[
+        question_index
+    ]:
+        return
+
+    save_submission(
+        participant_id=participant_id,
+        question_nr=question_index + 1,
+        response_type="initial",
+        content=st.session_state.answers[
+            question_index
+        ].strip(),
+    )
+
+    st.session_state.initial_submission_saved[
+        question_index
+    ] = True
+
+
+# =========================================================
+# Register participant and randomized question assignment
+# =========================================================
+
+if "participant_registered" not in st.session_state:
+    try:
+        register_participant(
+            participant_id=participant_id,
+            condition=None,
+        )
+
+        for question_index, question in enumerate(
+            QUESTIONS
+        ):
+            save_question_assignment(
+                participant_id=participant_id,
+                question_nr=question_index + 1,
+                question_id=question["id"],
+                condition=get_condition(question_index),
+            )
+
+    except Exception as error:
+        print(
+            "Database error while registering participant:",
+            repr(error),
+        )
+
+        st.error(
+            "Your participant session could not be "
+            "registered. Please inform the researcher."
+        )
+        st.stop()
+
+    st.session_state.participant_registered = True
+
 
 # =========================================================
 # Completed screen
 # =========================================================
 
-if st.session_state.submitted:
-
+if st.session_state.stage == "completed":
     st.success(
-        "Your answers have been submitted successfully."
+        "Your responses have been submitted successfully."
     )
 
     st.write(
@@ -225,22 +310,165 @@ if st.session_state.submitted:
 
 
 # =========================================================
+# Questionnaire stage
+# =========================================================
+
+if st.session_state.stage == "questionnaire":
+    st.progress(
+        1.0,
+        text="Questionnaire",
+    )
+
+    st.header("Questionnaire")
+
+    st.write(
+        "Please compare your experience with the LLM "
+        "during the two questions."
+    )
+
+    with st.form("questionnaire_form"):
+        perspectives = st.radio(
+            (
+                "During which question did the LLM "
+                "encourage you more to consider different "
+                "perspectives, explanations, or possible "
+                "approaches?"
+            ),
+            QUESTIONNAIRE_OPTIONS,
+            index=None,
+            key="questionnaire_perspectives",
+        )
+
+        steering = st.radio(
+            (
+                "During which question did the LLM seem "
+                "more likely to steer your reasoning toward "
+                "one particular conclusion or point of view?"
+            ),
+            QUESTIONNAIRE_OPTIONS,
+            index=None,
+            key="questionnaire_steering",
+        )
+
+        uncertainty = st.radio(
+            (
+                "During which question did the LLM "
+                "encourage you more to consider uncertainty, "
+                "limitations, or information that was not "
+                "known?"
+            ),
+            QUESTIONNAIRE_OPTIONS,
+            index=None,
+            key="questionnaire_uncertainty",
+        )
+
+        comments = st.text_area(
+            (
+                "Optional: Is there anything else you "
+                "would like to mention about your "
+                "experience with the LLM?"
+            ),
+            key="questionnaire_comments",
+        )
+
+        questionnaire_submitted = (
+            st.form_submit_button(
+                "Submit experiment",
+                type="primary",
+                use_container_width=True,
+            )
+        )
+
+    if questionnaire_submitted:
+        if (
+            perspectives is None
+            or steering is None
+            or uncertainty is None
+        ):
+            st.error(
+                "Please answer all three questionnaire "
+                "questions before submitting."
+            )
+
+        else:
+            questionnaire = {
+                "perspectives": perspectives,
+                "steering_toward_conclusion": steering,
+                "uncertainty_and_limitations": uncertainty,
+                "comments": comments.strip(),
+            }
+
+            try:
+                with st.spinner(
+                    "Submitting your responses..."
+                ):
+                    # Save final answers once more at the
+                    # point of final experiment submission.
+                    for question_index in range(
+                        len(QUESTIONS)
+                    ):
+                        save_final_answer(
+                            question_index
+                        )
+
+                    save_questionnaire_response(
+                        participant_id=participant_id,
+                        perspectives=perspectives,
+                        steering_toward_conclusion=steering,
+                        uncertainty_and_limitations=uncertainty,
+                        comments=comments.strip() or None,
+                    )
+
+                    mark_participant_completed(
+                        participant_id
+                    )
+
+            except Exception as error:
+                print(
+                    "Database error while submitting experiment:",
+                    repr(error),
+                )
+
+                st.error(
+                    "Your responses could not be submitted. "
+                    "Please try again or inform the researcher."
+                )
+
+            else:
+                st.session_state.questionnaire = (
+                    questionnaire
+                )
+                st.session_state.stage = "completed"
+                st.rerun()
+
+    st.stop()
+
+
+# =========================================================
+# Question stage
+# =========================================================
+
+question_index = st.session_state.current_question
+condition = get_condition(question_index)
+current_question = QUESTIONS[question_index]
+
+
+# =========================================================
 # Progress
 # =========================================================
 
 st.progress(
-    (question_index + 1) / len(QUESTIONS),
+    (question_index + 1) / (len(QUESTIONS) + 1),
     text=(
         f"Question {question_index + 1} "
         f"of {len(QUESTIONS)}"
-    )
+    ),
 )
 
 
 # =========================================================
 # Display current question
 # =========================================================
-current_question = QUESTIONS[question_index]
 
 st.subheader(
     f"Question {question_index + 1}"
@@ -257,9 +485,6 @@ st.write(
 )
 
 
-# This is what the LLM receives as context.
-# It contains both the scenario and the task.
-
 full_problem = (
     current_question["text"]
     + "\n\n"
@@ -273,7 +498,7 @@ full_problem = (
 
 answer_column, llm_column = st.columns(
     [1, 1],
-    gap="large"
+    gap="large",
 )
 
 
@@ -282,35 +507,30 @@ answer_column, llm_column = st.columns(
 # =========================================================
 
 with answer_column:
-
     st.markdown(
         "### Your answer"
     )
 
     st.caption(
-        "Write your final answer here. "
+        "Write your final answer here."
     )
-
 
     answer_widget_key = (
         f"answer_widget_{question_index}"
     )
 
-
     if answer_widget_key not in st.session_state:
-
         st.session_state[
             answer_widget_key
         ] = st.session_state.answers[
             question_index
         ]
 
-
     st.text_area(
         "Your response:",
         height=450,
         key=answer_widget_key,
-        label_visibility="collapsed"
+        label_visibility="collapsed",
     )
 
 
@@ -319,7 +539,6 @@ with answer_column:
 # =========================================================
 
 with llm_column:
-
     st.markdown(
         "### LLM assistant"
     )
@@ -327,19 +546,17 @@ with llm_column:
     st.caption(
         "You may use the LLM while working "
         "on the problem."
+
     )
-
-
+    st.info(
+    st.info(
+        "Please do not share any personal information with the LLM."
+    )
     conversation = (
         st.session_state.llm_messages[
             question_index
         ]
     )
-
-
-    # -----------------------------------------------------
-    # Count participant prompts
-    # -----------------------------------------------------
 
     number_of_prompts = sum(
         1
@@ -347,232 +564,143 @@ with llm_column:
         if message["role"] == "user"
     )
 
-
-
-
-
-
-    # -----------------------------------------------------
-    # Display conversation
-    # -----------------------------------------------------
-
     if not conversation:
-
         st.info(
             "No messages yet. "
             "You can ask the LLM about the problem."
         )
 
     else:
-
         for message in conversation:
-
             with st.chat_message(
                 message["role"]
             ):
-
                 st.write(
                     message["content"]
                 )
 
-
-    # -----------------------------------------------------
-    # LLM input
-    # -----------------------------------------------------
-
-
-
-
     with st.form(
-        key=(
-            f"llm_form_"
-            f"{question_index}"
-        ),
-        clear_on_submit=True
+        key=f"llm_form_{question_index}",
+        clear_on_submit=True,
     ):
-
         llm_prompt = st.text_area(
             "Message the LLM:",
             height=100,
-            placeholder=(
-                "Type your message here..."
-            )
+            placeholder="Type your message here...",
         )
 
         send_clicked = (
             st.form_submit_button(
                 "Send",
                 type="primary",
-                use_container_width=True
+                use_container_width=True,
             )
         )
 
-
-    # -----------------------------------------------------
-    # Handle LLM request
-    # -----------------------------------------------------
-
     if send_clicked:
-
         prompt = llm_prompt.strip()
 
-
         if not prompt:
-
             st.warning(
                 "Please enter a message."
             )
 
         else:
-
-            # Preserve the answer currently visible
-            # in the answer box before rerunning.
-
+            # Preserve the answer visible before the rerun.
             st.session_state.answers[
                 question_index
             ] = st.session_state[
                 answer_widget_key
             ]
 
+            try:
+                save_initial_answer_if_needed(
+                    question_index
+                )
+
+            except Exception as error:
+                print(
+                    "Database error while saving initial answer:",
+                    repr(error),
+                )
+                st.error(
+                    "Your answer could not be saved. "
+                    "Please inform the researcher."
+                )
+                st.stop()
 
             message_nr = (
                 number_of_prompts + 1
             )
 
-
-            # ---------------------------------------------
-            # Add participant message to conversation
-            # ---------------------------------------------
-
             user_message = {
                 "role": "user",
-                "content": prompt
+                "content": prompt,
             }
-
 
             conversation.append(
                 user_message
             )
 
-
-            # ---------------------------------------------
-            # Save participant message to PostgreSQL
-            # ---------------------------------------------
-
             try:
-
-                save_llm_message(
-                    participant_id=participant_id,
-                    question_nr=(
-                        question_index + 1
-                    ),
-                    message_nr=message_nr,
-                    role="user",
-                    content=prompt
-                )
-
-            except Exception as error:
-
-                print(
-                    "Database error while "
-                    "saving user LLM message:",
-                    repr(error)
-                )
-
-                # Remove message from local conversation
-                # because database storage failed.
-
-                conversation.pop()
-
-                st.error(
-                    "Your message could not be saved. "
-                    "Please inform the researcher."
-                )
-
-                st.stop()
-
-
-            # ---------------------------------------------
-            # Generate assistant response
-            # ---------------------------------------------
-
-            try:
-
                 with st.spinner(
                     "Generating response..."
                 ):
-
                     assistant_response = (
                         generate_llm_reply(
                             question=full_problem,
                             condition=condition,
-                            conversation=conversation
+                            conversation=conversation,
                         )
                     )
 
-
             except Exception as error:
-
                 print(
                     "LLM API error:",
-                    repr(error)
+                    repr(error),
                 )
+
+                # Remove the user message because this
+                # exchange was not completed.
+                conversation.pop()
 
                 st.error(
                     "The LLM could not respond. "
                     "Please try again."
                 )
 
-
             else:
-
-                # -----------------------------------------
-                # Add assistant message locally
-                # -----------------------------------------
-
-                assistant_message = {
-                    "role": "assistant",
-                    "content": assistant_response
-                }
-
-
-                conversation.append(
-                    assistant_message
-                )
-
-
-                # -----------------------------------------
-                # Save assistant response
-                # -----------------------------------------
-
                 try:
-
-                    save_llm_message(
+                    save_llm_exchange(
                         participant_id=participant_id,
-                        question_nr=(
-                            question_index + 1
-                        ),
+                        question_nr=question_index + 1,
                         message_nr=message_nr,
-                        role="assistant",
-                        content=assistant_response
+                        user_content=prompt,
+                        assistant_content=assistant_response,
                     )
 
                 except Exception as error:
-
                     print(
-                        "Database error while "
-                        "saving assistant message:",
-                        repr(error)
+                        "Database error while saving LLM exchange:",
+                        repr(error),
                     )
 
+                    # Keep session and database consistent:
+                    # remove the unsaved user message.
+                    conversation.pop()
+
                     st.error(
-                        "The LLM response could not "
-                        "be saved. Please inform "
-                        "the researcher."
+                        "The LLM interaction could not be "
+                        "saved. Please inform the researcher."
                     )
 
                 else:
-
+                    conversation.append(
+                        {
+                            "role": "assistant",
+                            "content": assistant_response,
+                        }
+                    )
                     st.rerun()
 
 
@@ -581,11 +709,6 @@ with llm_column:
 # =========================================================
 
 def temporarily_save_current_answer():
-    """
-    Save the currently visible answer from the widget
-    into the experiment's answer dictionary.
-    """
-
     st.session_state.answers[
         question_index
     ] = st.session_state[
@@ -599,7 +722,6 @@ def temporarily_save_current_answer():
 
 st.divider()
 
-
 previous_column, middle_column, next_column = (
     st.columns(
         [1, 3, 1]
@@ -608,36 +730,32 @@ previous_column, middle_column, next_column = (
 
 
 with previous_column:
-
     previous_clicked = st.button(
         "← Previous question",
         disabled=(
             question_index == 0
         ),
-        use_container_width=True
+        use_container_width=True,
     )
 
 
 with next_column:
-
     if question_index < len(QUESTIONS) - 1:
-
         next_clicked = st.button(
             "Next question →",
             type="primary",
-            use_container_width=True
+            use_container_width=True,
         )
 
-        submit_clicked = False
+        questionnaire_clicked = False
 
     else:
-
         next_clicked = False
 
-        submit_clicked = st.button(
-            "Submit answers",
+        questionnaire_clicked = st.button(
+            "Continue to questionnaire →",
             type="primary",
-            use_container_width=True
+            use_container_width=True,
         )
 
 
@@ -646,101 +764,99 @@ with next_column:
 # =========================================================
 
 if previous_clicked:
-
     temporarily_save_current_answer()
 
-    st.session_state.current_question -= 1
+    try:
+        save_final_answer(
+            question_index
+        )
+    except Exception as error:
+        print(
+            "Database error while saving answer:",
+            repr(error),
+        )
+        st.error(
+            "Your answer could not be saved. "
+            "Please inform the researcher."
+        )
+        st.stop()
 
+    st.session_state.current_question -= 1
     st.rerun()
 
 
 if next_clicked:
-
     temporarily_save_current_answer()
 
-    st.session_state.current_question += 1
+    if not st.session_state.answers[
+        question_index
+    ].strip():
+        st.error(
+            "Please answer this question before continuing."
+        )
+    else:
+        try:
+            save_final_answer(
+                question_index
+            )
+        except Exception as error:
+            print(
+                "Database error while saving answer:",
+                repr(error),
+            )
+            st.error(
+                "Your answer could not be saved. "
+                "Please inform the researcher."
+            )
+            st.stop()
 
-    st.rerun()
+        st.session_state.current_question += 1
+        st.rerun()
 
 
-# =========================================================
-# Final submission
-# =========================================================
-
-if submit_clicked:
-
+if questionnaire_clicked:
     temporarily_save_current_answer()
-
 
     unanswered_questions = [
-
         question_nr + 1
-
-        for (
-            question_nr,
-            answer
-        )
+        for question_nr, answer
         in st.session_state.answers.items()
-
         if not answer.strip()
     ]
 
-
     if unanswered_questions:
-
         unanswered_text = ", ".join(
             str(number)
-            for number
-            in unanswered_questions
+            for number in unanswered_questions
         )
-
 
         st.error(
             "Please answer all questions before "
-            "submitting. "
+            "continuing. "
             f"Missing: question {unanswered_text}."
         )
 
-
     else:
-
         try:
-
-            for (
-                question_nr,
-                answer
-            ) in st.session_state.answers.items():
-
-                save_submission(
-                    participant_id=participant_id,
-                    question_nr=question_nr + 1,
-                    response_type="final",
-                    content=answer.strip()
+            for question_index_to_save in range(
+                len(QUESTIONS)
+            ):
+                save_final_answer(
+                    question_index_to_save
                 )
 
-
-            mark_participant_completed(
-                participant_id
-            )
-
-
         except Exception as error:
-
             print(
-                "Database save error:",
-                repr(error)
+                "Database error while saving final answers:",
+                repr(error),
             )
-
             st.error(
                 "Your answers could not be saved. "
                 "Please inform the researcher."
             )
 
-
         else:
-
-            st.session_state.submitted = True
-
+            st.session_state.stage = "questionnaire"
             st.rerun()
 
 
@@ -751,39 +867,27 @@ if submit_clicked:
 with st.expander(
     "View answer progress"
 ):
-
-    # Make sure the current visible answer
-    # is represented correctly in the status display.
-
     current_visible_answer = (
         st.session_state[
             answer_widget_key
         ]
     )
 
-
-    for (
-        question_nr,
-        answer
-    ) in st.session_state.answers.items():
-
+    for question_nr, answer in (
+        st.session_state.answers.items()
+    ):
         if question_nr == question_index:
-
             answer_for_status = (
                 current_visible_answer
             )
-
         else:
-
             answer_for_status = answer
-
 
         status = (
             "Answered"
             if answer_for_status.strip()
             else "Not answered"
         )
-
 
         st.write(
             f"Question {question_nr + 1}: "
