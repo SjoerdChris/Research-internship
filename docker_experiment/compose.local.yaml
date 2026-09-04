@@ -1,0 +1,4 @@
+services:
+  sjoerd-experiment-app:
+    ports:
+      - "8501:8501"
